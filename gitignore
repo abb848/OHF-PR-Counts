@@ -1,0 +1,3 @@
+github_token.txt
+*.db
+__pycache__/
