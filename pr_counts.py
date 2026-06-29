@@ -83,30 +83,31 @@ def respect_rate_limit(response: requests.Response) -> None:
 
 
 def count_open_prs(session: requests.Session, slug: str) -> int:
-    """Count open PRs for a single repo using pagination."""
-    url = f"{API_BASE}/repos/home-assistant/{slug}/pulls"
-    params = {"state": "open", "per_page": 100, "page": 1}
-    total = 0
+    """Count open PRs for a single repo via the search API.
 
-    while True:
-        resp = session.get(url, params=params)
-        resp.raise_for_status()
-        items = resp.json()
-        total += len(items)
-        respect_rate_limit(resp)
+    Uses the same query as the meeting notes links:
+      is:open is:pr archived:false repo:home-assistant/{slug}
 
-        if len(items) < 100:
-            break
-        params["page"] += 1
-        time.sleep(0.5)
+    The REST pulls endpoint undercounts because it excludes PRs
+    whose head repo has been deleted or made private.
+    """
+    url = f"{API_BASE}/search/issues"
+    params = {
+        "q": f"is:open is:pr archived:false repo:home-assistant/{slug}",
+        "per_page": 1,
+    }
 
-    return total
+    resp = session.get(url, params=params)
+    resp.raise_for_status()
+    respect_rate_limit(resp)
+
+    return resp.json()["total_count"]
 
 
 def count_org_open_prs(session: requests.Session) -> int:
     """Count all open PRs across the home-assistant org via search API."""
     url = f"{API_BASE}/search/issues"
-    params = {"q": "org:home-assistant is:pr is:open", "per_page": 1}
+    params = {"q": "org:home-assistant is:pr is:open archived:false", "per_page": 1}
 
     resp = session.get(url, params=params)
     resp.raise_for_status()
