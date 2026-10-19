@@ -6,7 +6,7 @@ import os
 import sqlite3
 import sys
 import time
-from datetime import date
+from datetime import date, timedelta
 
 import requests
 
@@ -17,13 +17,18 @@ REPOS = [
     ("android", "Android"),
     ("brands", "Brands"),
     ("core", "Core"),
-    ("developers.home-assistant", "Developer docs"),
+    ("contributors.home-assistant.io", "Contributor docs"),
     ("home-assistant.io", "End-user docs"),
     ("frontend", "Frontend"),
     ("iOS", "iOS"),
     ("operating-system", "Operating system"),
     ("supervisor", "Supervisor"),
 ]
+
+ORG = "home-assistant"
+SECURITY_REPO = "core"
+SECURITY_ROW = "Security triage"
+MERGED_WINDOW_DAYS = 7
 
 DEFAULT_THRESHOLDS = {
     "Android": 20,
@@ -73,54 +78,78 @@ def make_session(token: str) -> requests.Session:
 
 
 def respect_rate_limit(response: requests.Response) -> None:
-    """Sleep briefly if rate limit is getting low."""
+    """Sleep if the rate limit is getting low."""
     remaining = response.headers.get("X-RateLimit-Remaining")
-    if remaining is not None and int(remaining) < 10:
+    if remaining is not None and int(remaining) < 3:
         reset_at = int(response.headers.get("X-RateLimit-Reset", 0))
         wait = max(reset_at - int(time.time()), 1)
         print(f"  Rate limit low ({remaining} remaining), sleeping {wait}s...")
         time.sleep(wait)
 
 
-def count_open_prs(session: requests.Session, slug: str) -> int:
-    """Count open PRs for a single repo via the search API.
+def search_count(session: requests.Session, query: str) -> int:
+    """Return the total_count for a GitHub issue/PR search query.
 
-    Uses the same query as the meeting notes links:
-      is:open is:pr archived:false repo:home-assistant/{slug}
-
-    The REST pulls endpoint undercounts because it excludes PRs
-    whose head repo has been deleted or made private.
+    Uses the same query style as the meeting notes links, so counts match
+    what you see when you click through on GitHub.
     """
-    url = f"{API_BASE}/search/issues"
-    params = {
-        "q": f"is:open is:pr archived:false repo:home-assistant/{slug}",
-        "per_page": 1,
-    }
-
-    resp = session.get(url, params=params)
+    resp = session.get(
+        f"{API_BASE}/search/issues", params={"q": query, "per_page": 1}
+    )
     resp.raise_for_status()
     respect_rate_limit(resp)
-
+    # Search API allows 30 requests a minute, so pace the calls
+    time.sleep(1)
     return resp.json()["total_count"]
+
+
+def count_open_prs(session: requests.Session, slug: str) -> int:
+    return search_count(session, f"is:open is:pr archived:false repo:{ORG}/{slug}")
+
+
+def count_merged_prs(session: requests.Session, slug: str, since: str) -> int:
+    return search_count(
+        session, f"is:pr is:merged archived:false repo:{ORG}/{slug} merged:>{since}"
+    )
 
 
 def count_org_open_prs(session: requests.Session) -> int:
-    """Count all open PRs across the home-assistant org via search API."""
-    url = f"{API_BASE}/search/issues"
-    params = {"q": "org:home-assistant is:pr is:open archived:false", "per_page": 1}
+    return search_count(session, f"org:{ORG} is:pr is:open archived:false")
 
-    resp = session.get(url, params=params)
-    resp.raise_for_status()
-    respect_rate_limit(resp)
 
-    return resp.json()["total_count"]
+def count_org_merged_prs(session: requests.Session, since: str) -> int:
+    return search_count(
+        session, f"org:{ORG} is:pr is:merged archived:false merged:>{since}"
+    )
+
+
+def count_security_triage(session: requests.Session) -> int:
+    """Count repository security advisories in the Triage state on core.
+
+    Needs the security_events scope (included in the classic repo scope)
+    and admin or security manager access on the repo.
+    """
+    url = f"{API_BASE}/repos/{ORG}/{SECURITY_REPO}/security-advisories"
+    params = {"state": "triage", "per_page": 100}
+    total = 0
+
+    while url:
+        resp = session.get(url, params=params)
+        resp.raise_for_status()
+        respect_rate_limit(resp)
+        total += len(resp.json())
+        # Follow the Link header; the next URL already carries the params
+        url = resp.links.get("next", {}).get("url")
+        params = None
+
+    return total
 
 
 # -- SQLite helpers -------------------------------------------------------------
 
 
 def init_db(db_path: str) -> sqlite3.Connection:
-    """Create tables if they don't exist and seed default thresholds."""
+    """Create tables if needed, add newer columns, seed default thresholds."""
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
 
@@ -130,10 +159,16 @@ def init_db(db_path: str) -> sqlite3.Connection:
             snapshot_date TEXT NOT NULL,
             repo          TEXT NOT NULL,
             open_count    INTEGER NOT NULL,
+            merged_count  INTEGER,
             PRIMARY KEY (snapshot_date, repo)
         )
         """
     )
+
+    # Existing databases were created before merged_count existed
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(pr_snapshots)")]
+    if "merged_count" not in columns:
+        conn.execute("ALTER TABLE pr_snapshots ADD COLUMN merged_count INTEGER")
 
     conn.execute(
         """
@@ -154,11 +189,21 @@ def init_db(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def write_snapshot(conn: sqlite3.Connection, snapshot_date: str, repo: str, count: int) -> None:
+def write_snapshot(
+    conn: sqlite3.Connection,
+    snapshot_date: str,
+    repo: str,
+    open_count: int,
+    merged_count: int | None,
+) -> None:
     """Upsert a single snapshot row."""
     conn.execute(
-        "INSERT OR REPLACE INTO pr_snapshots (snapshot_date, repo, open_count) VALUES (?, ?, ?)",
-        (snapshot_date, repo, count),
+        """
+        INSERT OR REPLACE INTO pr_snapshots
+            (snapshot_date, repo, open_count, merged_count)
+        VALUES (?, ?, ?, ?)
+        """,
+        (snapshot_date, repo, open_count, merged_count),
     )
 
 
@@ -190,17 +235,16 @@ def get_thresholds(conn: sqlite3.Connection) -> dict[str, int]:
 
 
 def print_summary(
-    results: list[tuple[str, int]],
+    results: list[tuple[str, int, int | None]],
     previous: dict[str, int],
     thresholds: dict[str, int],
 ) -> None:
     """Print a readable plain-text summary table."""
-    # Column widths
-    name_w = max(len(r[0]) for r in results)
-    name_w = max(name_w, len("Repository"))
+    name_w = max(len("Repository"), *(len(r[0]) for r in results))
 
     header = (
-        f"{'Repository':<{name_w}}  {'Current':>8}  {'Previous':>8}  {'Diff':>8}  {'Threshold':>9}"
+        f"{'Repository':<{name_w}}  {'Previous':>8}  {'Current':>8}  "
+        f"{'Diff':>6}  {'Merged':>6}  {'Threshold':>9}"
     )
     separator = "-" * len(header)
 
@@ -208,7 +252,7 @@ def print_summary(
     print(header)
     print(separator)
 
-    for repo_name, count in results:
+    for repo_name, count, merged in results:
         prev = previous.get(repo_name)
         thresh = thresholds.get(repo_name)
 
@@ -218,11 +262,12 @@ def print_summary(
             diff_str = f"+{diff}" if diff >= 0 else str(diff)
         else:
             diff_str = ""
-
+        merged_str = str(merged) if merged is not None else ""
         thresh_str = str(thresh) if thresh is not None else ""
 
         print(
-            f"{repo_name:<{name_w}}  {count:>8}  {prev_str:>8}  {diff_str:>8}  {thresh_str:>9}"
+            f"{repo_name:<{name_w}}  {prev_str:>8}  {count:>8}  "
+            f"{diff_str:>6}  {merged_str:>6}  {thresh_str:>9}"
         )
 
     print(separator)
@@ -248,61 +293,77 @@ def main():
     )
     args = parser.parse_args()
 
-    # Load token
     token = load_token()
     if not token:
         print(
             "Error: No GitHub token found.\n"
             "Either create github_token.txt in the same folder as this script,\n"
             "or set the GITHUB_TOKEN environment variable.\n\n"
-            "The token needs the repo scope (classic) or pull-request read access (fine-grained).",
+            "The token needs the repo scope (classic), which includes security_events.",
             file=sys.stderr,
         )
         sys.exit(1)
 
     session = make_session(token)
     snapshot_date = args.date
+    # Merged count covers the 7 days up to and including the snapshot date
+    since = (
+        date.fromisoformat(snapshot_date) - timedelta(days=MERGED_WINDOW_DAYS)
+    ).isoformat()
 
-    print(f"PR count snapshot for {snapshot_date}")
+    print(f"PR count snapshot for {snapshot_date} (merged after {since})")
     print()
 
-    # Collect counts
-    results: list[tuple[str, int]] = []
+    # Each result is (display name, open count, merged count or None)
+    results: list[tuple[str, int, int | None]] = []
+
+    def collect(name: str, open_fn, merged_fn) -> None:
+        try:
+            open_count = open_fn()
+        except Exception as e:
+            print(f"  {name}: ERROR - {e}", file=sys.stderr)
+            return
+
+        merged_count = None
+        if merged_fn is not None:
+            try:
+                merged_count = merged_fn()
+            except Exception as e:
+                print(f"  {name}: merged count ERROR - {e}", file=sys.stderr)
+
+        merged_note = f", {merged_count} merged" if merged_count is not None else ""
+        print(f"  {name}: {open_count} open{merged_note}")
+        results.append((name, open_count, merged_count))
 
     for slug, display_name in REPOS:
-        try:
-            count = count_open_prs(session, slug)
-            print(f"  {display_name}: {count} open PRs")
-            results.append((display_name, count))
-        except Exception as e:
-            print(f"  {display_name}: ERROR - {e}", file=sys.stderr)
+        collect(
+            display_name,
+            lambda s=slug: count_open_prs(session, s),
+            lambda s=slug: count_merged_prs(session, s, since),
+        )
 
-        time.sleep(0.5)
+    collect(
+        "Organization",
+        lambda: count_org_open_prs(session),
+        lambda: count_org_merged_prs(session, since),
+    )
 
-    # Org-wide count
-    try:
-        org_count = count_org_open_prs(session)
-        print(f"  Organization: {org_count} open PRs")
-        results.append(("Organization", org_count))
-    except Exception as e:
-        print(f"  Organization: ERROR - {e}", file=sys.stderr)
+    collect(SECURITY_ROW, lambda: count_security_triage(session), None)
 
     if not results:
         print("No data collected. Exiting.", file=sys.stderr)
         sys.exit(1)
 
-    # Write to SQLite
     conn = init_db(args.db)
     try:
-        for repo_name, count in results:
-            write_snapshot(conn, snapshot_date, repo_name, count)
+        for repo_name, open_count, merged_count in results:
+            write_snapshot(conn, snapshot_date, repo_name, open_count, merged_count)
         conn.commit()
         print(f"\nWrote {len(results)} rows to {args.db}")
     except Exception as e:
         print(f"Database error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Summary
     previous = get_previous_counts(conn, snapshot_date)
     thresholds = get_thresholds(conn)
     print_summary(results, previous, thresholds)
