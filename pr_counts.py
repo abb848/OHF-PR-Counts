@@ -13,7 +13,7 @@ import requests
 # -- Repo config ---------------------------------------------------------------
 
 REPOS = [
-    ("addons", "Addons"),
+    ("apps", "Apps"),
     ("android", "Android"),
     ("brands", "Brands"),
     ("core", "Core"),
